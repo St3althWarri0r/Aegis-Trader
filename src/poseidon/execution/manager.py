@@ -661,11 +661,10 @@ class OrderManager:
             await asyncio.sleep(interval)
             if is_gtc:  # a resting order rarely fills in the first seconds; ease off
                 interval = min(interval * 1.5, _POLL_INTERVAL_MAX)
-            try:
-                order = await broker.order_status(order)
-            except BrokerError as exc:
-                log.warning("order status poll failed", order_id=order.id, error=str(exc))
+            polled = await self._poll_order_status(order, broker)
+            if polled is None:
                 continue
+            order = polled
             if (order.status is OrderStatus.FILLED and order.slippage_bps is None
                     and order.arrival_price is not None and order.avg_fill_price is not None):
                 order.slippage_bps = slippage_bps(order.side, order.arrival_price,
@@ -855,22 +854,9 @@ class OrderManager:
                 continue
             targets.append((resting, True))
             seen.update(k for k in (resting.client_order_id, resting.broker_order_id) if k)
-        try:
-            live = await broker.open_orders()
-        except Exception as exc:  # noqa: BLE001 — the live view is additive; a failed
-            # read must not stall the exit (the duplicate guard under _submit_lock
-            # fails closed on its own read a moment later).
-            log.warning("could not read the live book to clear opposing orders",
-                        symbol=symbol, error=str(exc))
-            live = []
-        for resting in live:
-            if (resting.symbol.upper() != symbol or resting.side is not OrderSide.BUY
-                    or not resting.status.is_open_at_broker):
+        for resting in await self._live_only_open_orders(broker, seen):
+            if resting.symbol.upper() != symbol or resting.side is not OrderSide.BUY:
                 continue
-            keys = [k for k in (resting.client_order_id, resting.broker_order_id) if k]
-            if any(k in seen for k in keys):
-                continue  # the DB view already holds this order
-            seen.update(keys)
             targets.append((resting, False))
         for resting, known in targets:
             try:
@@ -887,28 +873,79 @@ class OrderManager:
             record = {"order_id": resting.id, "symbol": resting.symbol,
                       "for_order": order.id, "known": known,
                       "broker_order_id": canceled.broker_order_id}
-            if canceled.status.is_terminal:
+            filled_any = (canceled.status is OrderStatus.FILLED
+                         or canceled.filled_quantity > 0)
+            if filled_any:
+                # It FILLED instead of canceling — a real fill, not a cancel.
+                # Surface it exactly like a normal fill (ORDER_FILLED + an
+                # order.filled audit fact), never as a mislabeled
+                # "…_canceled"/"…_unconfirmed" entry: for a live-only order
+                # (known=False, no local row, no lifecycle poller ever
+                # spawned for it) this bus event is the ONLY trace anywhere
+                # that the account's position just changed — the guardian
+                # and the portfolio resync both key off ORDER_FILLED.
+                await self._audit.append("system", "order.filled",
+                                         {**record, "filled_qty": str(canceled.filled_quantity)})
+                await self._bus.publish(Topics.ORDER_FILLED,
+                                        {"order": canceled.model_dump(mode="json")})
+            elif canceled.status.is_terminal:
                 await self._audit.append("system", "exit.opposing_order_canceled", record)
             else:
                 await self._audit.append("system", "exit.opposing_cancel_unconfirmed",
                                          {**record, "status": canceled.status.value})
 
-    @staticmethod
-    async def _confirm_cancel(order: Order, broker: Broker) -> Order:
+    async def _live_only_open_orders(self, broker: Broker, seen: set[str]) -> list[Order]:
+        """The broker's live open-order book, excluding anything already known
+        via ``seen`` (client/broker order ids a caller's own DB-view scan
+        already covers). A live-only order — parked from the brokerage's own
+        UI, or a local row whose status drifted — is invisible to a DB-only
+        scan; the broker's self-trade block (and an emergency halt) do not
+        care who placed it. Mutates ``seen`` with every key it returns."""
+        try:
+            live = await broker.open_orders()
+        except Exception as exc:  # noqa: BLE001 — additive: a failed read must not
+            # block whatever the caller's own DB-known view already found.
+            log.warning("could not read the live order book", error=str(exc))
+            return []
+        extra: list[Order] = []
+        for resting in live:
+            if not resting.status.is_open_at_broker:
+                continue
+            keys = [k for k in (resting.client_order_id, resting.broker_order_id) if k]
+            if any(k in seen for k in keys):
+                continue  # the caller's DB view already holds this order
+            seen.update(keys)
+            extra.append(resting)
+        return extra
+
+    async def _confirm_cancel(self, order: Order, broker: Broker) -> Order:
         """Poll a queued cancel to its terminal state, bounded by
-        ``_CANCEL_CONFIRM_ATTEMPTS`` x ``_CANCEL_CONFIRM_INTERVAL``. Returns the
-        latest broker view either way; a status-poll failure ends the wait."""
+        ``_CANCEL_CONFIRM_ATTEMPTS`` x ``_CANCEL_CONFIRM_INTERVAL``. Returns
+        the latest broker view either way; a status-poll failure is retried
+        within the same budget rather than ending the wait on one transient
+        blip — a single hiccup on the very first poll used to collapse the
+        whole ~3s/6-attempt confirmation window down to one attempt."""
         for _ in range(_CANCEL_CONFIRM_ATTEMPTS):
             if order.status.is_terminal:
                 break
             await asyncio.sleep(_CANCEL_CONFIRM_INTERVAL)
-            try:
-                order = await broker.order_status(order)
-            except BrokerError as exc:
-                log.warning("cancel confirmation poll failed", order_id=order.id,
-                            error=str(exc))
-                break
+            polled = await self._poll_order_status(order, broker)
+            if polled is not None:
+                order = polled
         return order
+
+    @staticmethod
+    async def _poll_order_status(order: Order, broker: Broker) -> Order | None:
+        """One ``order_status()`` call, tolerant of a transient ``BrokerError``
+        (logged; ``None`` returned so the caller's own loop controls retry
+        timing/backoff). The one polling primitive ``_poll_to_terminal`` and
+        ``_confirm_cancel`` both build on, so a future change to broker-error
+        handling on a status poll needs to land in exactly one place."""
+        try:
+            return await broker.order_status(order)
+        except BrokerError as exc:
+            log.warning("order status poll failed", order_id=order.id, error=str(exc))
+            return None
 
     async def cancel_all_open(self, *, reason: str) -> HaltCleanupSummary:
         """Cancel every order the broker may still hold live — the first cleanup
@@ -939,6 +976,12 @@ class OrderManager:
             f"SELECT payload FROM orders WHERE status IN ({placeholders})",
             _OPEN_AT_BROKER_STATUSES,
         )
+        # (order, known_locally) — mirrors _clear_opposing_orders: the orders
+        # table alone can miss an order parked from the brokerage's own UI, or
+        # a local row whose status drifted, and an emergency halt must cancel
+        # EVERY resting order, not just the ones this platform placed.
+        targets: list[tuple[Order, bool]] = []
+        seen: set[str] = set()
         for (payload,) in rows:
             order = Order.model_validate(json.loads(payload))
             # Never cancel an order that belongs to another brokerage: its ids
@@ -946,6 +989,10 @@ class OrderManager:
             if order.broker and order.broker != self._broker.name:
                 summary.skipped.append(order.id)
                 continue
+            targets.append((order, True))
+            seen.update(k for k in (order.client_order_id, order.broker_order_id) if k)
+        targets.extend((o, False) for o in await self._live_only_open_orders(self._broker, seen))
+        for order, known in targets:
             try:
                 canceled = await self._broker.cancel_order(order)
             except Exception as exc:  # noqa: BLE001 — ANY failure is recorded, never
@@ -957,11 +1004,12 @@ class OrderManager:
                                          {"order_id": order.id, "symbol": order.symbol,
                                           "error": str(exc)})
                 continue
-            await self._persist(canceled)
+            if known:
+                await self._persist(canceled)
             summary.canceled.append(order.id)
             await self._audit.append("human", "halt.order_canceled",
                                      {"order_id": order.id, "symbol": order.symbol,
-                                      "reason": reason})
+                                      "reason": reason, "known": known})
         return summary
 
     def _build_flatten_exit(self, position: Position) -> Order:
