@@ -4,6 +4,78 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
+## [2.19.0] — 2026-09-01
+
+A full-codebase audit release. Every safety-critical path — the order
+manager, risk rules and engine, the position guardian, the AI agent loop and
+tool dispatcher, both model backends, the Alpaca and paper brokers, portfolio
+sync, the kernel's control paths, the dashboard API, config, vault, audit
+chain, data router, SSRF guard, launcher and updater — was re-read end to
+end, the dependency stack brought current, and every defect the reading
+surfaced fixed with a regression test. No new data sources; the engine had
+been idle since 2026-08-16, so everything here came from the code, not from
+an incident.
+
+### Safety
+
+- **A freshly armed stop can no longer be disarmed by a stale portfolio
+  snapshot.** A fill arms a guardian plan the instant the order poller sees
+  it, but the snapshot the guardian checks positions against refreshes only
+  on the sync interval. The guardian's next tick (15s in the scalping config)
+  therefore routinely ran against a snapshot older than the fill, found "no
+  position", and deactivated the brand-new stop as *position no longer held*
+  — leaving each fresh entry unprotected until a later decision happened to
+  re-arm it. A missing position is now believed only from a snapshot taken at
+  least 10s after the plan was armed (the same grace the risk engine gives an
+  order that lands mid-sync-pass); an older snapshot keeps the plan armed and
+  the guardian retries next tick.
+- **The portfolio re-syncs on every fill.** An `ORDER_FILLED` event now
+  triggers an immediate sync pass, so a new position is visible to the
+  guardian, the risk engine's pending-exposure reconciliation and the
+  dashboard within about a second instead of up to a full sync interval.
+- **Clearing an opposing resting BUY now consults the broker's live book and
+  waits for the cancel to confirm.** The v2.18.0 wash-trade fix canceled only
+  the BUYs Poseidon's own orders table listed as open, and submitted the SELL
+  the instant the broker acknowledged the cancel request. Alpaca's DELETE
+  merely *queues* a cancel, and its self-trade block does not care who placed
+  the resting buy, so both gaps could reproduce the very 403 the fix exists to
+  prevent. The clear now merges the live open-order book with the local rows
+  (a live-only order is canceled and audited, never persisted as a synthetic
+  row) and polls each cancel to a terminal state — bounded to ~3s — before the
+  exit goes out; an unconfirmed cancel is audited as
+  `exit.opposing_cancel_unconfirmed` and the exit still proceeds.
+
+### Changed
+
+- **Anthropic SDK 1.x.** `anthropic>=1,<2` (1.0.0 shipped 2026-08-20 with an
+  unbounded `>=0.49` pin in place; the whole suite and strict mypy were
+  verified against 1.3.0 before pinning). The SDK's HTTP layer is now
+  `httpx2` — the maintained fork of `httpx` by its original author, published
+  by Pydantic (github.com/pydantic/httpx2) — which arrives transitively; the
+  platform's own `httpx` clients (providers, brokers, the local-model backend)
+  are unchanged and the two coexist. The deployment's updater installs the
+  new packages on the next launch.
+- **Default Claude model is `claude-opus-5`** (same $5 / $25 per MTok metering
+  defaults as `claude-opus-4-8`). The dashboard's curated menu is now
+  `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`. Haiku 4.5 is removed
+  from the menu: it rejects the adaptive-thinking + effort request shape the
+  Anthropic backend sends on every completion, so selecting it — as the
+  primary or as `ai.utility_model` — produced a 400 on the first call. The
+  documented cheap utility tier is now `claude-sonnet-5`.
+- **`cryptography>=50`** — PYSEC-2026-3552 / CVE-2026-69247 (a Bleichenbacher
+  oracle in PKCS#7 EnvelopedData decryption). Poseidon's vault uses Fernet +
+  scrypt only and never touched the affected API, so nothing was exposed; the
+  floor moves so a dependency scan of a deployment comes back clean.
+- CI now also runs on Python 3.14 (the interpreter the deployment runs on;
+  float-summation and other CPython-version-specific behavior has bitten
+  before).
+- `submit_decision`'s trade schema accepts `asset_class: "crypto"` so a
+  BASE/USD proposal is labelled honestly (a slash-form symbol was, and still
+  is, tagged crypto regardless of the label).
+- `EventBus.publish_nowait` for synchronous fire-and-forget publishes; the
+  risk engine's circuit-breaker trip uses it instead of a bare
+  `create_task` whose result nothing held.
+
 ## [2.18.0] — 2026-08-15
 
 The constant-scalping release, built the same night v2.17.0 shipped, from

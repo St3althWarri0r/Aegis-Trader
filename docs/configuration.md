@@ -3,7 +3,7 @@
 File: `~/.config/poseidon/poseidon.yaml` (override with `poseidon
 --config`). Validated strictly at startup — unknown keys and invalid values
 refuse to boot. Environment variables `POSEIDON_SECTION__FIELD=value` override
-file values (e.g. `POSEIDON_AI__MODEL=claude-opus-4-8`,
+file values (e.g. `POSEIDON_AI__MODEL=claude-opus-5`,
 `POSEIDON_DASHBOARD__HOST=0.0.0.0`).
 
 Secrets never appear in this file: fields named `credential` hold the
@@ -21,7 +21,7 @@ Secrets never appear in this file: fields named `credential` hold the
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `model` | `claude-opus-4-8` | any current Claude model ID |
+| `model` | `claude-opus-5` | any current Claude model ID |
 | `effort` | `high` | `low`–`max`; higher = deeper reasoning per cycle |
 | `max_tokens` | 16000 | per API call |
 | `api_key_credential` | `anthropic_api_key` | vault entry name |

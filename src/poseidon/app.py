@@ -229,6 +229,9 @@ class ApplicationKernel:
         self.dashboard: DashboardServer
         self.updates: UpdateService
         self._cycle_lock = asyncio.Lock()
+        # Coalescing state for the fill-triggered portfolio sync (_sync_after_fill).
+        self._fill_sync_running = False
+        self._resync_pending = False
         # Set when a cycle COMPLETES; the model health probe reads it.
         self._last_cycle_completed_at: datetime | None = None
         # Serializes halt() and resume() so a resume can never interleave with a
@@ -384,6 +387,14 @@ class ApplicationKernel:
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
         self.sync = PortfolioSyncService(self.broker, self.portfolio, self.bus, self.db, self.clock)
+        # A fill changes the book NOW, but the snapshot every consumer reads —
+        # the guardian's position check, the risk engine's pending-exposure
+        # reconciliation, the dashboard — refreshes only on the sync interval.
+        # Re-sync on each fill so a fresh position is visible within a second
+        # rather than up to a full interval later (the guardian additionally
+        # refuses to believe a "no position" reading from a snapshot older than
+        # the plan it would disarm; this makes that wait short).
+        self.bus.subscribe(Topics.ORDER_FILLED, self._sync_after_fill)
         self.strategy_health = StrategyHealthService(
             db=self.db, config=cfg.strategy_health,
             load_trips=self._load_strategy_trips,
@@ -543,6 +554,35 @@ class ApplicationKernel:
                 self.vault.set, broker_cfg.credential, json.dumps(broker.rotated_credentials)
             )
         return broker
+
+    async def _sync_after_fill(self, _topic: str, _payload: object) -> None:
+        """Refresh the portfolio snapshot right after a fill (see the ORDER_FILLED
+        subscription in ``start``).
+
+        Coalesced: a burst of fills (a scalper can close several legs in one
+        second) must not queue one full sync pass — six broker calls — per
+        fill behind ``_sync_lock`` and eat the broker's request budget. While a
+        fill-sync is running, later fills only raise ``_resync_pending``; the
+        running handler loops once more if that flag was raised during its
+        pass, so a fill that lands mid-pass still gets a sync that STARTED
+        after it. Best-effort: a failed pass is logged and the periodic loop
+        retries on its own cadence — never raises into the bus."""
+        if self._fill_sync_running:
+            self._resync_pending = True
+            return
+        self._fill_sync_running = True
+        try:
+            while True:
+                self._resync_pending = False
+                try:
+                    await self.sync.sync_once()
+                except Exception as exc:  # noqa: BLE001 — an event handler must not die on a broker hiccup
+                    log.warning("post-fill portfolio sync failed; the periodic sync will retry",
+                                error=str(exc))
+                if not self._resync_pending:
+                    return
+        finally:
+            self._fill_sync_running = False
 
     async def _on_circuit_opened(self, _topic: str, payload: object) -> None:
         """Record automatic circuit-breaker trips in the tamper-evident audit

@@ -145,9 +145,9 @@ class RiskEngine:
         if self.circuit.record_error(reason):
             # publish is fire-and-forget; engine methods stay sync-friendly.
             # The kernel subscribes CIRCUIT_OPENED to the audit log (app.py).
-            asyncio.get_running_loop().create_task(
-                self._bus.publish(Topics.CIRCUIT_OPENED, {"reason": reason})
-            )
+            # publish_nowait holds the task reference (a bare create_task can
+            # be garbage-collected before it runs).
+            self._bus.publish_nowait(Topics.CIRCUIT_OPENED, {"reason": reason})
 
     def _roll_daily_counter(self) -> None:
         today = self._clock.now_eastern().date().isoformat()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -47,7 +47,10 @@ class KernelStub:
         self.audit = SimpleNamespace(append=self._audit_append)
         self.bus = SimpleNamespace(publish=self._publish)
         self.router = SimpleNamespace(quote=self._quote)
-        self.portfolio = SimpleNamespace(position_for=self._position_for)
+        # synced_at mirrors PortfolioState: the guardian only trusts a "no
+        # position" reading from a snapshot taken after the plan was armed.
+        self.portfolio = SimpleNamespace(position_for=self._position_for,
+                                         synced_at=datetime.now(UTC))
 
     async def _execute_decision(self, decision):
         self.executed_decisions.append(decision)
@@ -346,13 +349,75 @@ async def test_plans_are_broker_scoped(tmp_path) -> None:
     await db.close()
 
 
+async def _backdate_plan(db: Database, symbol: str, seconds: int) -> None:
+    """Make a plan look as if it was armed ``seconds`` ago (its updated_at)."""
+    await db.execute(
+        "UPDATE exit_plans SET updated_at = ? WHERE symbol = ?",
+        ((datetime.now(UTC) - timedelta(seconds=seconds)).isoformat(), symbol),
+    )
+
+
 async def test_plan_deactivates_when_position_gone(tmp_path) -> None:
     db = await _db_with_decision(tmp_path, stop="95", target="120")
     kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty="10")
     guardian = PositionGuardian(GuardianConfig(), db, kernel)
     await guardian.on_order_filled("order.filled", filled_buy())
-    kernel._position_qty = None  # position closed externally / by the AI
+    await _backdate_plan(db, "AAPL", 60)  # armed a minute ago ...
+    kernel._position_qty = None  # ... position closed externally / by the AI ...
+    kernel.portfolio.synced_at = datetime.now(UTC)  # ... and a sync since confirms it
     await guardian.check_all()
     assert await guardian.active_plans() == []
     assert kernel.executed_decisions == []
+    await db.close()
+
+
+async def test_plan_survives_a_snapshot_older_than_its_arming(tmp_path) -> None:
+    """Regression: a fill arms a plan, then the guardian ticks BEFORE the periodic
+    portfolio sync has seen that fill. position_for() is None only because the
+    snapshot is stale — the position is real. Disarming here left every fresh
+    scalp entry unprotected until the next decision happened to re-arm it
+    (guardian interval 15s vs sync interval 30s: a coin flip per fill, at best).
+    """
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty=None)
+    kernel.portfolio.synced_at = datetime.now(UTC) - timedelta(seconds=20)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())
+    await guardian.check_all()
+    assert [p["symbol"] for p in await guardian.active_plans()] == ["AAPL"]
+    assert kernel.executed_decisions == []
+    # A sync taken well AFTER the arming that still shows no position IS proof.
+    await _backdate_plan(db, "AAPL", 60)
+    kernel.portfolio.synced_at = datetime.now(UTC)
+    await guardian.check_all()
+    assert await guardian.active_plans() == []
+    await db.close()
+
+
+async def test_plan_survives_a_sync_inside_the_grace_window(tmp_path) -> None:
+    """A sync whose fetches straddled the fill can finish after the arming and
+    still miss the position; the same 10s grace the risk engine gives an order
+    submitted mid-sync-pass applies before a missing position is believed."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty=None)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())
+    kernel.portfolio.synced_at = datetime.now(UTC) + timedelta(seconds=2)  # 2s after arming
+    await guardian.check_all()
+    assert [p["symbol"] for p in await guardian.active_plans()] == ["AAPL"]
+    await db.close()
+
+
+async def test_sell_fill_does_not_disarm_on_a_stale_snapshot(tmp_path) -> None:
+    """A partial exit fill on a position the snapshot has not seen yet must not
+    disarm the remainder's stop."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty=None)
+    kernel.portfolio.synced_at = datetime.now(UTC) - timedelta(seconds=20)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy(qty="10"))
+    partial = Order(symbol="AAPL", side=OrderSide.SELL, quantity=Decimal("4"),
+                    filled_quantity=Decimal("4"), status=OrderStatus.FILLED, strategy="ai")
+    await guardian.on_order_filled("order.filled", {"order": partial.model_dump(mode="json")})
+    assert [p["symbol"] for p in await guardian.active_plans()] == ["AAPL"]
     await db.close()

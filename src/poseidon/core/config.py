@@ -8,7 +8,7 @@ credential *names* which resolve through the encrypted vault
 (:mod:`poseidon.security.vault`).
 
 Environment variables prefixed with ``POSEIDON_`` override file values using
-``__`` as the nesting delimiter, e.g. ``POSEIDON_AI__MODEL=claude-opus-4-8``.
+``__`` as the nesting delimiter, e.g. ``POSEIDON_AI__MODEL=claude-opus-5``.
 """
 
 from __future__ import annotations
@@ -245,7 +245,7 @@ class PMToolsConfig(StrictModel):
 
 
 class AIConfig(StrictModel):
-    model: str = "claude-opus-4-8"
+    model: str = "claude-opus-5"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     max_tokens: int = Field(default=16000, ge=1024, le=128000)
     api_key_credential: str = "anthropic_api_key"  # vault entry name
@@ -276,7 +276,8 @@ class AIConfig(StrictModel):
     # edit can never balloon the prompt; empty renders nothing.
     mandate: str = Field(default="", max_length=1200)
     review_interval_seconds: int = Field(default=300, ge=30)
-    # Metering (USD per million tokens; defaults match claude-opus-4-8).
+    # Metering (USD per million tokens; defaults match claude-opus-5 and
+    # claude-opus-4-8 — both $5 / $25 per MTok).
     input_price_per_mtok: float = Field(default=5.0, ge=0)
     output_price_per_mtok: float = Field(default=25.0, ge=0)
     # Hard monthly spend ceiling; review cycles pause when the estimate hits

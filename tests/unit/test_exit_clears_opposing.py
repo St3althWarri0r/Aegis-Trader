@@ -187,3 +187,136 @@ async def test_end_to_end_sell_clears_buy_then_submits(stack) -> None:
     exits = await manager.execute_decision(make_exit_decision("10"))
     assert canceled == [resting_buy.id]
     assert exits[0].status is OrderStatus.FILLED
+
+
+async def test_sell_cancels_a_live_resting_buy_the_db_does_not_know(stack) -> None:
+    """The broker's LIVE book is consulted too: a same-symbol BUY resting at the
+    broker that Poseidon's orders table does not list as open (placed from the
+    brokerage's own UI, or a row whose status drifted) would trip the same
+    wash-trade block. It is canceled and audited, but never persisted as a
+    synthetic local row."""
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    external = _order("AAPL", OrderSide.BUY, status=OrderStatus.ACCEPTED)
+    external.broker_order_id = "ext-1"
+    canceled: list[str] = []
+
+    async def fake_open_orders() -> list[Order]:
+        return [external]
+
+    async def fake_cancel(order: Order) -> Order:
+        canceled.append(order.broker_order_id or order.id)
+        order.status = OrderStatus.CANCELED
+        return order
+
+    broker.open_orders = fake_open_orders  # type: ignore[method-assign]
+    broker.cancel_order = fake_cancel  # type: ignore[method-assign]
+    sell = _order("AAPL", OrderSide.SELL, broker="")
+    await manager._clear_opposing_orders(sell, broker)
+    assert canceled == ["ext-1"]
+    assert "exit.opposing_order_canceled" in await _audit_actions(db)
+    rows = await db.fetch_all("SELECT COUNT(*) FROM orders")
+    assert rows[0][0] == 0  # no synthetic row for an order we never placed
+
+
+async def test_live_and_db_views_of_one_order_cancel_it_once(stack) -> None:
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    resting = _order("AAPL", OrderSide.BUY)
+    resting.broker_order_id = "b-1"
+    await _persist_resting(db, resting)
+    live_view = _order("AAPL", OrderSide.BUY, status=OrderStatus.ACCEPTED)
+    live_view.client_order_id = resting.client_order_id
+    live_view.broker_order_id = "b-1"
+    canceled: list[str] = []
+
+    async def fake_open_orders() -> list[Order]:
+        return [live_view]
+
+    async def fake_cancel(order: Order) -> Order:
+        canceled.append(order.broker_order_id or order.id)
+        order.status = OrderStatus.CANCELED
+        return order
+
+    broker.open_orders = fake_open_orders  # type: ignore[method-assign]
+    broker.cancel_order = fake_cancel  # type: ignore[method-assign]
+    await manager._clear_opposing_orders(_order("AAPL", OrderSide.SELL, broker=""), broker)
+    assert canceled == ["b-1"]
+
+
+async def test_sell_waits_for_an_asynchronous_cancel_to_confirm(stack, monkeypatch) -> None:
+    """Alpaca's DELETE only QUEUES the cancel: cancel_order comes back with the
+    order still open (pending_cancel -> ACCEPTED). Submitting the SELL that
+    instant can still hit the self-trade block, so the clear waits — bounded —
+    for the broker to confirm the cancel before the exit goes out."""
+    from poseidon.execution import manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "_CANCEL_CONFIRM_INTERVAL", 0.0)
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    resting = _order("AAPL", OrderSide.BUY)
+    resting.broker_order_id = "b-2"
+    await _persist_resting(db, resting)
+    polls: list[str] = []
+
+    async def queued_cancel(order: Order) -> Order:
+        order.status = OrderStatus.ACCEPTED  # cancel requested, not yet confirmed
+        order.status_reason = "cancel requested — awaiting broker confirmation"
+        return order
+
+    async def status_poll(order: Order) -> Order:
+        polls.append(order.broker_order_id or "")
+        if len(polls) >= 2:
+            order.status = OrderStatus.CANCELED
+        return order
+
+    broker.cancel_order = queued_cancel  # type: ignore[method-assign]
+    broker.order_status = status_poll  # type: ignore[method-assign]
+    await manager._clear_opposing_orders(_order("AAPL", OrderSide.SELL, broker=""), broker)
+    assert polls == ["b-2", "b-2"]
+    row = await db.fetch_all("SELECT status FROM orders WHERE id = ?", (resting.id,))
+    assert row[0][0] == OrderStatus.CANCELED.value
+
+
+async def test_unconfirmed_cancel_is_audited_and_the_exit_still_proceeds(
+        stack, monkeypatch) -> None:
+    from poseidon.execution import manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "_CANCEL_CONFIRM_INTERVAL", 0.0)
+    monkeypatch.setattr(manager_mod, "_CANCEL_CONFIRM_ATTEMPTS", 2)
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    resting = _order("AAPL", OrderSide.BUY)
+    resting.broker_order_id = "b-3"
+    await _persist_resting(db, resting)
+
+    async def queued_cancel(order: Order) -> Order:
+        order.status = OrderStatus.ACCEPTED
+        return order
+
+    async def never_confirms(order: Order) -> Order:
+        return order
+
+    broker.cancel_order = queued_cancel  # type: ignore[method-assign]
+    broker.order_status = never_confirms  # type: ignore[method-assign]
+    await manager._clear_opposing_orders(_order("AAPL", OrderSide.SELL, broker=""), broker)
+    actions = await _audit_actions(db)
+    assert "exit.opposing_cancel_unconfirmed" in actions
+
+
+async def test_live_book_read_failure_does_not_block_the_clear(stack) -> None:
+    from poseidon.core.errors import BrokerError
+
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    resting = _order("AAPL", OrderSide.BUY)
+    await _persist_resting(db, resting)
+    canceled: list[str] = []
+
+    async def broken_open_orders() -> list[Order]:
+        raise BrokerError("paper", "book unreadable")
+
+    async def fake_cancel(order: Order) -> Order:
+        canceled.append(order.id)
+        order.status = OrderStatus.CANCELED
+        return order
+
+    broker.open_orders = broken_open_orders  # type: ignore[method-assign]
+    broker.cancel_order = fake_cancel  # type: ignore[method-assign]
+    await manager._clear_opposing_orders(_order("AAPL", OrderSide.SELL, broker=""), broker)
+    assert canceled == [resting.id]  # the DB view still cleared its row

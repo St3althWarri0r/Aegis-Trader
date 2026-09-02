@@ -66,6 +66,12 @@ _POLL_INTERVAL_MAX = 300.0  # long-lived GTC polls back off to every 5 min
 # longer, resume_open_orders() re-attaches a fresh poller on the next restart.
 _POLL_TIMEOUT_DAY = 8 * 60 * 60
 _POLL_TIMEOUT_GTC = 5 * 24 * 60 * 60
+# A broker cancel can be asynchronous (alpaca's DELETE only queues it): after
+# clearing an opposing resting BUY, the exit waits — bounded — for the broker
+# to confirm the cancel before it submits, or the SELL can still trip the
+# self-trade block the clear exists to avoid. ~3s worst case at the defaults.
+_CANCEL_CONFIRM_ATTEMPTS = 6
+_CANCEL_CONFIRM_INTERVAL = 0.5
 
 
 @dataclass(frozen=True)
@@ -817,21 +823,56 @@ class OrderManager:
         an incoming entry. Mirrors ``cancel_all_open``'s per-order contract:
         cancel exactly once, any failure is audited and skipped (the exit then
         proceeds and may still be rejected broker-side — honest, not wedged),
-        and cross-broker rows are never touched."""
+        and cross-broker rows are never touched.
+
+        Two views of the book are merged. The orders table finds the BUYs this
+        platform placed; the broker's LIVE open orders find the rest — a buy
+        parked from the brokerage's own UI, or a local row whose status drifted
+        — because the broker's self-trade block does not care who placed it.
+        A live-only order is canceled and audited but never persisted as a
+        synthetic local row. Then each cancel is CONFIRMED (bounded polling)
+        because a broker may only queue it: submitting the SELL before the
+        buy is actually gone reproduces the very 403 this exists to prevent.
+        An unconfirmed cancel is audited and the exit still proceeds."""
         if order.side is not OrderSide.SELL or order.legs:
             return
+        symbol = order.symbol.upper()
         placeholders = ", ".join("?" * len(_OPEN_AT_BROKER_STATUSES))
         rows = await self._db.fetch_all(
             f"SELECT payload FROM orders WHERE status IN ({placeholders})",
             _OPEN_AT_BROKER_STATUSES,
         )
+        # (order, known_locally) — a local row is persisted after the cancel,
+        # a live-only order is not (we hold no row for it).
+        targets: list[tuple[Order, bool]] = []
+        seen: set[str] = set()
         for (payload,) in rows:
             resting = Order.model_validate(json.loads(payload))
             if (resting.id == order.id
-                    or resting.symbol.upper() != order.symbol.upper()
+                    or resting.symbol.upper() != symbol
                     or resting.side is not OrderSide.BUY
                     or (resting.broker and resting.broker != broker.name)):
                 continue
+            targets.append((resting, True))
+            seen.update(k for k in (resting.client_order_id, resting.broker_order_id) if k)
+        try:
+            live = await broker.open_orders()
+        except Exception as exc:  # noqa: BLE001 — the live view is additive; a failed
+            # read must not stall the exit (the duplicate guard under _submit_lock
+            # fails closed on its own read a moment later).
+            log.warning("could not read the live book to clear opposing orders",
+                        symbol=symbol, error=str(exc))
+            live = []
+        for resting in live:
+            if (resting.symbol.upper() != symbol or resting.side is not OrderSide.BUY
+                    or not resting.status.is_open_at_broker):
+                continue
+            keys = [k for k in (resting.client_order_id, resting.broker_order_id) if k]
+            if any(k in seen for k in keys):
+                continue  # the DB view already holds this order
+            seen.update(keys)
+            targets.append((resting, False))
+        for resting, known in targets:
             try:
                 canceled = await broker.cancel_order(resting)
             except Exception as exc:  # noqa: BLE001 — recorded, never retried:
@@ -840,10 +881,34 @@ class OrderManager:
                                          {"order_id": resting.id, "symbol": resting.symbol,
                                           "for_order": order.id, "error": str(exc)})
                 continue
-            await self._persist(canceled)
-            await self._audit.append("system", "exit.opposing_order_canceled",
-                                     {"order_id": resting.id, "symbol": resting.symbol,
-                                      "for_order": order.id})
+            canceled = await self._confirm_cancel(canceled, broker)
+            if known:
+                await self._persist(canceled)
+            record = {"order_id": resting.id, "symbol": resting.symbol,
+                      "for_order": order.id, "known": known,
+                      "broker_order_id": canceled.broker_order_id}
+            if canceled.status.is_terminal:
+                await self._audit.append("system", "exit.opposing_order_canceled", record)
+            else:
+                await self._audit.append("system", "exit.opposing_cancel_unconfirmed",
+                                         {**record, "status": canceled.status.value})
+
+    @staticmethod
+    async def _confirm_cancel(order: Order, broker: Broker) -> Order:
+        """Poll a queued cancel to its terminal state, bounded by
+        ``_CANCEL_CONFIRM_ATTEMPTS`` x ``_CANCEL_CONFIRM_INTERVAL``. Returns the
+        latest broker view either way; a status-poll failure ends the wait."""
+        for _ in range(_CANCEL_CONFIRM_ATTEMPTS):
+            if order.status.is_terminal:
+                break
+            await asyncio.sleep(_CANCEL_CONFIRM_INTERVAL)
+            try:
+                order = await broker.order_status(order)
+            except BrokerError as exc:
+                log.warning("cancel confirmation poll failed", order_id=order.id,
+                            error=str(exc))
+                break
+        return order
 
     async def cancel_all_open(self, *, reason: str) -> HaltCleanupSummary:
         """Cancel every order the broker may still hold live — the first cleanup
