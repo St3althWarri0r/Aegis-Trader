@@ -14,9 +14,11 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+import pytest
 
 from poseidon.brokers.plugins.alpaca import AlpacaBroker
-from poseidon.core.enums import AssetClass, OrderSide, OrderType, TimeInForce
+from poseidon.core.enums import AssetClass, OrderSide, OrderStatus, OrderType, TimeInForce
+from poseidon.core.errors import BrokerError
 from poseidon.core.models import Order
 
 _CREDS = {"key_id": "k", "secret_key": "s"}
@@ -127,3 +129,24 @@ async def test_positions_canonicalize_slashless_crypto_symbols() -> None:
     # keys off the broker's asset_class, never off symbol shape.
     assert positions[2].symbol == "BTCUSD"
     assert positions[2].asset_class is AssetClass.EQUITY
+
+
+async def test_order_status_raises_broker_error_on_malformed_fill_data() -> None:
+    # A boundary failure — Alpaca's own response carries an unparseable
+    # filled_qty — must surface as BrokerError, the exception every caller
+    # (_confirm_cancel, _poll_to_terminal) already knows how to degrade on,
+    # never as an unhandled decimal.InvalidOperation that abandons whatever
+    # operation was polling (e.g. clearing an opposing order before an exit).
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/v2/orders/broker-order-1")
+        return httpx.Response(200, json={
+            "id": "broker-order-1", "status": "filled", "filled_qty": "not-a-number",
+        }, headers={"content-type": "application/json"})
+
+    broker = AlpacaBroker(credentials=_CREDS)
+    broker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    order = Order(symbol="AAPL", side=OrderSide.BUY, quantity=Decimal("1"),
+                  status=OrderStatus.SUBMITTED, broker_order_id="broker-order-1")
+
+    with pytest.raises(BrokerError):
+        await broker.order_status(order)

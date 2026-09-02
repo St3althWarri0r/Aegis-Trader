@@ -23,11 +23,12 @@ review cycles.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import structlog
 
+from ..core.clock import synced_after
 from ..core.config import GuardianConfig
 from ..core.enums import (
     DecisionAction,
@@ -56,10 +57,10 @@ _EXIT_FAILED = {OrderStatus.REJECTED_RISK, OrderStatus.REJECTED_BROKER,
 # the moment the order poller sees it, but the portfolio snapshot is refreshed on
 # the sync interval — so the guardian's next tick routinely runs against a
 # snapshot older than the fill, sees no position, and (before this guard) disarmed
-# the brand-new stop as "position no longer held". The grace mirrors the risk
-# engine's ``_reconcile_pending``: a sync pass whose fetches straddled the fill
-# stamps ``synced_at`` after the arming yet still misses the position.
-_SNAPSHOT_GRACE = timedelta(seconds=10)
+# the brand-new stop as "position no longer held". ``core.clock.synced_after``
+# supplies the grace, shared with the risk engine's ``_reconcile_pending`` (the
+# analogous "is this snapshot fresh enough to trust a missing order/position"
+# question) so the two windows can never drift out of step with each other.
 
 
 class PositionGuardian:
@@ -89,21 +90,31 @@ class PositionGuardian:
         if order.side.is_buy and order.decision_id:
             await self._register_plan_for(order)
         elif order.side.is_risk_reducing:
-            position = self._kernel.portfolio.position_for(order.symbol)  # type: ignore[attr-defined]
-            still_open = position is not None and position.quantity > 0
-            if order.strategy == "guardian" and still_open:
-                # The guardian's own exit only PARTIALLY closed (the rest
-                # canceled/expired). _trigger_exit already latched the plan
-                # inactive, and a partial-then-terminal exit is routed to
-                # ORDER_FILLED (not ORDER_UPDATED), so the on_order_update
-                # re-arm never fires. Re-arm here or the residual has no stop
-                # between review cycles.
-                await self._rearm(order.symbol)
-                await self._kernel.bus.publish(Topics.NOTIFY, {  # type: ignore[attr-defined]
-                    "level": "warning", "title": f"Guardian exit partial: {order.symbol}",
-                    "body": f"Exit filled {order.filled_quantity}; {position.quantity} still "
-                            "held — stop re-armed for the remainder. Review the position.",
-                })
+            if order.strategy == "guardian":
+                # Whether the guardian's own exit closed the position IN FULL
+                # is decided from the order's OWN fill data, never the
+                # portfolio snapshot: ORDER_FILLED here and the kernel's
+                # fill-triggered portfolio resync are unordered concurrent
+                # handlers of the same event (app.py's _sync_after_fill), so a
+                # snapshot read right now can still show the pre-fill
+                # quantity. filled_quantity/quantity on this order carry no
+                # such race — they are exactly what this fill closed.
+                remaining = order.quantity - order.filled_quantity
+                if remaining > 0:
+                    # Only PARTIALLY closed (the rest canceled/expired).
+                    # _trigger_exit already latched the plan inactive, and a
+                    # partial-then-terminal exit is routed to ORDER_FILLED
+                    # (not ORDER_UPDATED), so the on_order_update re-arm never
+                    # fires. Re-arm here or the residual has no stop between
+                    # review cycles.
+                    await self._rearm(order.symbol)
+                    await self._kernel.bus.publish(Topics.NOTIFY, {  # type: ignore[attr-defined]
+                        "level": "warning", "title": f"Guardian exit partial: {order.symbol}",
+                        "body": f"Exit filled {order.filled_quantity}; {remaining} still "
+                                "held — stop re-armed for the remainder. Review the position.",
+                    })
+                # A full close needs no action: _trigger_exit already latched
+                # the plan inactive.
             else:
                 await self._maybe_deactivate(order.symbol, "position reduced/closed")
 
@@ -161,6 +172,14 @@ class PositionGuardian:
     async def _maybe_deactivate(self, symbol: str, reason: str) -> None:
         portfolio = self._kernel.portfolio  # type: ignore[attr-defined]
         position = portfolio.position_for(symbol)
+        # Captured together, before the fetch_one await below can yield the
+        # event loop to a concurrent full portfolio sync — otherwise a fresh
+        # ``synced_at`` read after that await could pair with THIS stale
+        # ``position`` read to wrongly validate a "position gone" reading
+        # that predates the sync that actually confirmed it (a race distinct
+        # from the exit_plans compare-and-swap below: this one lives entirely
+        # in the in-memory PortfolioState, no DB row ever changes).
+        synced_at = getattr(portfolio, "synced_at", None)
         # A qty-0 row (some brokers report one after a same-day flat) counts
         # as gone — otherwise the plan stays armed with stale levels and can
         # force-sell a later manual re-buy on its first tick.
@@ -172,39 +191,29 @@ class PositionGuardian:
         )
         if row is None:
             return
-        if not self._snapshot_postdates_arming(portfolio, str(row[0])):
+        armed_at_iso = str(row[0])
+        try:
+            armed_at = datetime.fromisoformat(armed_at_iso)
+        except ValueError:
+            armed_at = None  # an unparseable stamp cannot hold a plan armed forever
+        if armed_at is not None and not synced_after(synced_at, armed_at):
             # The snapshot predates the arming (or was never taken): "no
             # position" says nothing about the fill that armed this plan. Keep
             # the stop; the next sync will either show the position (and the
             # guardian enforces) or, taken after the grace, prove it gone.
             log.info("exit plan kept armed: portfolio snapshot predates its arming",
-                     symbol=symbol, armed_at=row[0],
-                     synced_at=getattr(portfolio, "synced_at", None))
+                     symbol=symbol, armed_at=armed_at_iso, synced_at=synced_at)
             return
+        # Compare-and-swap on updated_at: a concurrent fill can re-arm this
+        # exact row (a new decision_id/stop/quantity) between the SELECT above
+        # and this UPDATE. Pinning the WHERE to the value just read means a
+        # re-arm in that window makes this UPDATE match zero rows instead of
+        # silently clobbering the fresh arming back to inactive.
         await self._db.execute(
             "UPDATE exit_plans SET active = 0, triggered_reason = ?, updated_at = ? "
-            "WHERE symbol = ? AND active = 1",
-            (reason, datetime.now(UTC).isoformat(), symbol.upper()),
+            "WHERE symbol = ? AND active = 1 AND updated_at = ?",
+            (reason, datetime.now(UTC).isoformat(), symbol.upper(), armed_at_iso),
         )
-
-    @staticmethod
-    def _snapshot_postdates_arming(portfolio: object, armed_at_iso: str) -> bool:
-        """True only when the portfolio snapshot was taken at least
-        ``_SNAPSHOT_GRACE`` after the plan was armed — the only snapshot whose
-        missing position can be believed. A never-synced portfolio (``None``)
-        proves nothing."""
-        synced_at = getattr(portfolio, "synced_at", None)
-        if not isinstance(synced_at, datetime):
-            return False
-        try:
-            armed_at = datetime.fromisoformat(armed_at_iso)
-        except ValueError:
-            return True  # an unparseable stamp cannot hold a plan armed forever
-        if armed_at.tzinfo is None:
-            armed_at = armed_at.replace(tzinfo=UTC)
-        if synced_at.tzinfo is None:
-            synced_at = synced_at.replace(tzinfo=UTC)
-        return synced_at >= armed_at + _SNAPSHOT_GRACE
 
     # -- the watch loop (scheduler job) ------------------------------------------
 
@@ -226,11 +235,11 @@ class PositionGuardian:
         # never fire here. Legacy rows (broker='') still match the active
         # broker so pre-upgrade plans keep protecting their positions.
         rows = await self._db.fetch_all(
-            "SELECT symbol, decision_id, stop_loss, take_profit FROM exit_plans "
+            "SELECT symbol, decision_id, stop_loss, take_profit, updated_at FROM exit_plans "
             "WHERE active = 1 AND broker IN (?, '')",
             (kernel.broker.name,),  # type: ignore[attr-defined]
         )
-        for symbol, decision_id, stop_raw, target_raw in rows:
+        for symbol, decision_id, stop_raw, target_raw, updated_at in rows:
             if not equities_tradeable and not is_crypto_symbol(symbol):
                 continue  # an equity exit genuinely cannot execute while closed
             position = kernel.portfolio.position_for(symbol)  # type: ignore[attr-defined]
@@ -238,6 +247,12 @@ class PositionGuardian:
                 await self._maybe_deactivate(symbol, "position no longer held")
                 continue
             try:
+                # Awaits the network: a concurrent fill can re-arm this plan's
+                # row (new decision_id/stop/quantity) while this is in flight.
+                # ``updated_at`` (read above, before this await) rides through
+                # to ``_trigger_exit`` as the compare-and-swap token, so a
+                # re-arm in this window is detected there rather than firing
+                # an exit sized/keyed off what is now stale data.
                 quote = await kernel.router.quote(symbol, allow_delayed=False)  # type: ignore[attr-defined]
             except DataError as exc:
                 log.warning("guardian cannot price position; will retry",
@@ -254,18 +269,29 @@ class PositionGuardian:
             elif target is not None and price >= target:
                 breach = f"take profit: {symbol} at {price} >= target {target}"
             if breach:
-                await self._trigger_exit(symbol, decision_id, position.quantity, price, breach)
+                await self._trigger_exit(symbol, decision_id, position.quantity, price, breach,
+                                         str(updated_at))
 
     async def _trigger_exit(self, symbol: str, decision_id: str, quantity: Decimal,
-                            price: Decimal, reason: str) -> None:
+                            price: Decimal, reason: str, expected_updated_at: str) -> None:
         kernel = self._kernel
         now = datetime.now(UTC).isoformat()
         # Latch first so a slow/failed exit cannot fire once per tick forever;
         # the outcome (fill or rejection) is notified and audited either way.
-        await self._db.execute(
-            "UPDATE exit_plans SET active = 0, triggered_reason = ?, updated_at = ? WHERE symbol = ?",
-            (reason, now, symbol.upper()),
+        # Compare-and-swap on updated_at (pinned to the value check_all read
+        # before its quote await): if a concurrent fill re-armed this row in
+        # that window, this UPDATE matches zero rows rather than clobbering
+        # the fresh arming and firing an exit against stale decision_id/
+        # stop/quantity.
+        affected = await self._db.execute(
+            "UPDATE exit_plans SET active = 0, triggered_reason = ?, updated_at = ? "
+            "WHERE symbol = ? AND active = 1 AND updated_at = ?",
+            (reason, now, symbol.upper(), expected_updated_at),
         )
+        if affected == 0:
+            log.info("guardian exit skipped: plan changed since it was read",
+                     symbol=symbol, reason=reason)
+            return
         await kernel.audit.append("guardian", "exit.triggered",  # type: ignore[attr-defined]
                                   {"symbol": symbol, "reason": reason, "price": str(price)})
         log.warning("guardian exit triggered", symbol=symbol, reason=reason)

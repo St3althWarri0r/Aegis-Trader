@@ -338,10 +338,15 @@ class Database:
                 await conn.rollback()
                 raise
 
-    async def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
+    async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
+        """Returns the affected row count — callers doing a compare-and-swap
+        UPDATE (a WHERE clause pinned to a previously-read value) use this to
+        detect a concurrent write and abandon a decision made against stale
+        state, rather than blindly trusting their own read."""
         async with self._write_lock:
-            await self.conn.execute(sql, tuple(params))
+            cursor = await self.conn.execute(sql, tuple(params))
             await self.conn.commit()
+            return cursor.rowcount
 
     async def fetch_all(self, sql: str, params: Iterable[Any] = ()) -> list[tuple[Any, ...]]:
         cursor = await self.conn.execute(sql, tuple(params))

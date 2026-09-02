@@ -300,6 +300,84 @@ async def test_unconfirmed_cancel_is_audited_and_the_exit_still_proceeds(
     assert "exit.opposing_cancel_unconfirmed" in actions
 
 
+async def test_one_transient_poll_error_does_not_end_the_confirm_wait(
+        stack, monkeypatch) -> None:
+    """A single transient BrokerError on the confirm-poll must be retried
+    within the attempt budget, not collapse ~3s/6-attempts down to one
+    attempt — that reproduces the exact self-trade 403 this mechanism exists
+    to prevent, from one blip rather than a sustained broker failure."""
+    from poseidon.core.errors import BrokerError
+    from poseidon.execution import manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "_CANCEL_CONFIRM_INTERVAL", 0.0)
+    monkeypatch.setattr(manager_mod, "_CANCEL_CONFIRM_ATTEMPTS", 3)
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    resting = _order("AAPL", OrderSide.BUY)
+    resting.broker_order_id = "b-flaky"
+    await _persist_resting(db, resting)
+    polls: list[str] = []
+
+    async def queued_cancel(order: Order) -> Order:
+        order.status = OrderStatus.ACCEPTED
+        return order
+
+    async def flaky_then_confirms(order: Order) -> Order:
+        polls.append("poll")
+        if len(polls) == 1:
+            raise BrokerError("alpaca", "transient blip", retryable=True)
+        order.status = OrderStatus.CANCELED
+        return order
+
+    broker.cancel_order = queued_cancel  # type: ignore[method-assign]
+    broker.order_status = flaky_then_confirms  # type: ignore[method-assign]
+    await manager._clear_opposing_orders(_order("AAPL", OrderSide.SELL, broker=""), broker)
+
+    assert len(polls) == 2, "the blip must be retried, not end the wait"
+    actions = await _audit_actions(db)
+    assert "exit.opposing_order_canceled" in actions
+    assert "exit.opposing_cancel_unconfirmed" not in actions
+
+
+async def test_opposing_order_that_fills_during_confirm_is_surfaced_as_a_fill(
+        stack, monkeypatch) -> None:
+    """The opposing BUY fills instead of canceling while the confirm-poll is
+    waiting. This is a real fill — the account's position just changed — and
+    must be surfaced exactly like any other fill (ORDER_FILLED + an
+    order.filled audit fact), never mislabeled "…_canceled"."""
+    from poseidon.execution import manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "_CANCEL_CONFIRM_INTERVAL", 0.0)
+    manager, broker, db = stack["manager"], stack["broker"], stack["db"]
+    resting = _order("AAPL", OrderSide.BUY, qty="5")
+    resting.broker_order_id = "b-fill"
+    await _persist_resting(db, resting)
+    published: list[dict] = []
+
+    async def on_filled(_topic: str, payload: object) -> None:
+        published.append(payload)  # type: ignore[arg-type]
+
+    manager._bus.subscribe("order.filled", on_filled)
+
+    async def queued_cancel(order: Order) -> Order:
+        order.status = OrderStatus.ACCEPTED
+        return order
+
+    async def status_poll(order: Order) -> Order:
+        order.status = OrderStatus.FILLED
+        order.filled_quantity = Decimal("5")
+        return order
+
+    broker.cancel_order = queued_cancel  # type: ignore[method-assign]
+    broker.order_status = status_poll  # type: ignore[method-assign]
+    await manager._clear_opposing_orders(_order("AAPL", OrderSide.SELL, broker=""), broker)
+    await manager._bus.close()  # drain the fire-and-forget publish before asserting
+
+    actions = await _audit_actions(db)
+    assert "order.filled" in actions
+    assert "exit.opposing_order_canceled" not in actions
+    assert published and published[0]["order"]["status"] == OrderStatus.FILLED.value
+
+
 async def test_live_book_read_failure_does_not_block_the_clear(stack) -> None:
     from poseidon.core.errors import BrokerError
 

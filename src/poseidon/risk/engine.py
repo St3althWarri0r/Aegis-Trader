@@ -16,7 +16,7 @@ from pathlib import Path
 
 import structlog
 
-from ..core.clock import MarketClock
+from ..core.clock import MarketClock, synced_after
 from ..core.config import RiskConfig
 from ..core.enums import AssetClass
 from ..core.errors import CircuitBreakerOpen, DataError, RiskViolation
@@ -137,8 +137,10 @@ class RiskEngine:
             return
         open_coids = {o.client_order_id for o in self._portfolio.open_orders if o.client_order_id}
         for oid, (coid, _s, _n, _o, submitted_at) in list(self._pending.items()):
-            # 10s grace covers an order submitted mid-sync-pass.
-            if coid not in open_coids and synced_at > submitted_at + timedelta(seconds=10):
+            # The grace covers an order submitted mid-sync-pass; shared with the
+            # guardian's stale-snapshot disarm guard (core.clock.SYNC_GRACE) so
+            # the two can never drift out of step.
+            if coid not in open_coids and synced_after(synced_at, submitted_at):
                 del self._pending[oid]
 
     def note_execution_error(self, reason: str) -> None:

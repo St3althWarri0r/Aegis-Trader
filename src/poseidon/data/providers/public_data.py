@@ -23,10 +23,11 @@ instruments instead of equities.
 from __future__ import annotations
 
 import time
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ...core.clock import ensure_aware
 from ...core.enums import OptionRight
 from ...core.errors import ProviderAuthError, ProviderError
 from ...core.models import Bar, Greeks, OptionChain, OptionContract, Quote
@@ -80,7 +81,7 @@ def _ts(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return ensure_aware(parsed)
 
 
 class PublicDataProvider(MarketDataProvider):

@@ -67,6 +67,12 @@ class FakeBroker:
         order.status = OrderStatus.CANCELED
         return order
 
+    async def open_orders(self) -> list[Order]:
+        # cancel_all_open merges this live view with the orders table so a
+        # halt cancels an order the DB doesn't know about too; empty here
+        # keeps these DB-only-scoped tests exercising just that view.
+        return []
+
 
 @pytest.fixture
 async def harness(tmp_path):
@@ -135,6 +141,36 @@ async def test_cancels_each_open_order_once(harness) -> None:
     for order in (a, b, c):
         row = await harness["db"].fetch_one("SELECT status FROM orders WHERE id = ?", (order.id,))
         assert row[0] == OrderStatus.CANCELED.value
+
+
+# -- test_cancels_a_live_order_the_db_does_not_know --------------------------------
+
+async def test_cancels_a_live_order_the_db_does_not_know(harness) -> None:
+    """F: an order parked from the brokerage's own UI (or a local row whose
+    status drifted) has no row in the orders table, but is still live at the
+    broker — an emergency halt must cancel it too, not just the rows this
+    platform placed. Mirrors _clear_opposing_orders' live-book merge."""
+    manager, broker = harness["manager"], harness["broker"]
+    known = await _seed_open(manager, symbol="AAPL", broker="fake")
+    external = Order(symbol="MSFT", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal("3"), limit_price=Decimal("50"), broker="fake",
+                     status=OrderStatus.ACCEPTED, broker_order_id="ext-1")
+
+    async def fake_open_orders() -> list[Order]:
+        return [external]
+
+    broker.open_orders = fake_open_orders  # type: ignore[method-assign]
+
+    summary = await manager.cancel_all_open(reason="operator HALT")
+
+    assert sorted(broker.cancel_calls) == sorted([known.id, external.id])
+    assert set(summary.canceled) == {known.id, external.id}
+    # The DB-known order is persisted CANCELED; the live-only one gets no
+    # synthetic row (mirrors _clear_opposing_orders' known/live-only split).
+    row = await harness["db"].fetch_one("SELECT status FROM orders WHERE id = ?", (known.id,))
+    assert row[0] == OrderStatus.CANCELED.value
+    rows = await harness["db"].fetch_all("SELECT id FROM orders")
+    assert {r[0] for r in rows} == {known.id}
 
 
 # -- test_open_at_broker_statuses_derive_from_enum ---------------------------------
@@ -214,7 +250,7 @@ async def test_returns_summary(harness) -> None:
     # Frozen: fields cannot be reassigned.
     with pytest.raises(FrozenInstanceError):
         summary.canceled = ["x"]  # type: ignore[misc]
-    # Empty book → empty summary (no crash, no broker call).
+    # Empty book → empty summary (no crash, no cancel calls).
     assert summary.canceled == []
     assert summary.failed == []
     assert summary.skipped == []
