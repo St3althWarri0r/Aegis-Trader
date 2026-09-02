@@ -13,8 +13,8 @@ from .anthropic_backend import AnthropicBackend
 from .base import ChatBackend, LLMResponse, ToolCall, ToolResult
 from .openai_backend import OpenAICompatibleBackend
 
-__all__ = ["CURATED_CLAUDE_MODELS", "ChatBackend", "LLMResponse", "ToolCall",
-           "ToolResult", "add_usage", "build_backend", "build_backends", "sum_usage"]
+__all__ = ["CURATED_CLAUDE_MODELS", "KNOWN_BROKEN_CLAUDE_MODELS", "ChatBackend", "LLMResponse",
+           "ToolCall", "ToolResult", "add_usage", "build_backend", "build_backends", "sum_usage"]
 
 # Curated Claude model ids offered by the dashboard model selector (GET
 # /api/models → anthropic.models). Seeded from the canonical in-repo ids
@@ -34,6 +34,20 @@ CURATED_CLAUDE_MODELS: tuple[str, ...] = (
     "claude-opus-4-8",
     "claude-sonnet-5",
 )
+
+# Ids removed from the curated menu above because they 400 on the request
+# shapes this backend always sends — kept here (never just deleted) so
+# `poseidon config validate`/`poseidon doctor` can warn an operator whose
+# ``ai.model``/``ai.utility_model`` still names one, instead of the config
+# silently validating while every completion 400s. AIConfig itself accepts
+# any string for these fields (a local/openai_compatible id is legitimate),
+# so this is a warning list, never a hard validation gate.
+KNOWN_BROKEN_CLAUDE_MODELS: dict[str, str] = {
+    "claude-haiku-4-5-20251001": (
+        "takes the legacy budget_tokens thinking form and rejects "
+        "output_config.effort — 400s on every completion"
+    ),
+}
 
 
 def add_usage(acc: list[dict[str, int]] | None, usage: object) -> None:

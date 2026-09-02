@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ...core.clock import ensure_aware
 from ...core.errors import ProviderError
 from ...core.models import Bar, Quote
 from ...core.symbols import is_crypto_symbol, normalize_crypto_symbol
@@ -146,4 +147,4 @@ class CoinbaseDataProvider(MarketDataProvider):
             parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except ValueError:
             return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return ensure_aware(parsed)

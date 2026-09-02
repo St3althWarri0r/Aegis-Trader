@@ -43,7 +43,13 @@ class KernelStub:
         self.audit = SimpleNamespace(append=self._audit_append)
         self.bus = SimpleNamespace(publish=self._publish)
         self.router = SimpleNamespace(quote=self._quote)
-        self.portfolio = SimpleNamespace(position_for=self._position_for)
+        # synced_at mirrors PortfolioState (kept in sync with test_guardian.py's
+        # KernelStub, which this one is a self-contained copy of): the
+        # snapshot-grace guard reads it via getattr, so a stub missing this
+        # field would silently sit at "no proof" for the postdates-arming
+        # check instead of exercising the intended path.
+        self.portfolio = SimpleNamespace(position_for=self._position_for,
+                                         synced_at=datetime.now(UTC))
 
     async def _execute_decision(self, decision):
         self.executed_decisions.append(decision)
@@ -145,4 +151,42 @@ async def test_f014_partial_guardian_exit_rearms_residual(tmp_path) -> None:
     finally:
         # Close the DB even when an assertion fails (e.g. on pre-fix code), or the
         # lingering aiosqlite connection hangs pytest teardown instead of failing fast.
+        await db.close()
+
+
+# Whether a guardian exit closed IN FULL must be decided from the order's OWN
+# fill data (filled_quantity vs quantity), never the portfolio snapshot:
+# ORDER_FILLED here and the kernel's fill-triggered portfolio resync
+# (app.py's _sync_after_fill) are unordered concurrent handlers of the same
+# event, so a snapshot read at this instant can still show the pre-fill
+# state. Pre-fix, on_order_filled trusted position_for() to decide
+# "still_open"; a stale snapshot showing NO position for a fill that only
+# PARTIALLY closed made it skip the re-arm entirely, leaving the residual
+# unprotected.
+async def test_partial_guardian_exit_rearms_even_when_portfolio_snapshot_is_stale(
+        tmp_path) -> None:
+    db = await _db_with_decision(tmp_path, stop="180", target=None)
+    try:
+        # The snapshot is stale/never-synced for this symbol (position_qty=None)
+        # even though a real 40-share residual is actually held — exactly the
+        # race a not-yet-landed post-fill resync produces.
+        kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="179", position_qty=None)
+        guardian = PositionGuardian(GuardianConfig(), db, kernel)
+
+        await guardian.on_order_filled("order.filled", filled_buy(symbol="AAPL", qty="100"))
+        await db.execute(
+            "UPDATE exit_plans SET active = 0, triggered_reason = ? WHERE symbol = ?",
+            ("stop loss: AAPL at 179 <= stop 180", "AAPL"),
+        )
+        assert await guardian.active_plans() == []  # latched inactive
+
+        await guardian.on_order_filled("order.filled", guardian_partial_exit())
+
+        # Re-armed for the residual despite the stale "no position" snapshot —
+        # the decision came from the order's own filled_quantity (60 of 100),
+        # not from position_for().
+        plans = await guardian.active_plans()
+        assert len(plans) == 1
+        assert plans[0]["symbol"] == "AAPL"
+    finally:
         await db.close()

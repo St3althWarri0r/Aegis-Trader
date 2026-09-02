@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from ..core.clock import ensure_aware
 from ..core.errors import ProviderAuthError, ProviderError, ProviderRateLimitError
 from ..core.models import (
     Bar,
@@ -212,9 +213,7 @@ class MarketDataProvider(abc.ABC):
             return None
         if dt is None:
             return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return max(0.0, (dt - datetime.now(UTC)).total_seconds())
+        return max(0.0, (ensure_aware(dt) - datetime.now(UTC)).total_seconds())
 
     @staticmethod
     def _now() -> datetime:

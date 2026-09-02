@@ -61,8 +61,33 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def ensure_aware(dt: datetime) -> datetime:
+    """Treat a naive timestamp as UTC — never as a different, unstated zone."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 def calendar_covers(day: date) -> bool:
     return day.year in _CALENDAR_YEARS
+
+
+# Grace given to a portfolio snapshot before the ABSENCE of an order/position
+# in it is believed: a sync pass whose broker fetches straddled a submission
+# or a fill can stamp ``synced_at`` after that event yet still miss it (its
+# fetches started before the event landed). Shared by the risk engine's
+# pending-exposure reconciliation (``RiskEngine._reconcile_pending``) and the
+# guardian's stale-snapshot disarm guard so the two grace windows can never
+# drift out of step with each other.
+SYNC_GRACE = timedelta(seconds=10)
+
+
+def synced_after(synced_at: datetime | None, reference_at: datetime,
+                 *, grace: timedelta = SYNC_GRACE) -> bool:
+    """True only when ``synced_at`` was taken at least ``grace`` after
+    ``reference_at`` — the only snapshot whose missing order/position can be
+    trusted. A snapshot never taken (``None``) proves nothing."""
+    if synced_at is None:
+        return False
+    return ensure_aware(synced_at) >= ensure_aware(reference_at) + grace
 
 
 @dataclass(frozen=True)

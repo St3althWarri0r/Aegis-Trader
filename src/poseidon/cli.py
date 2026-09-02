@@ -436,7 +436,21 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ConfigError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        print(f"Configuration valid. mode={config.mode.value}, "
+        # AIConfig accepts any model string (a local/openai_compatible id is
+        # legitimate), so a broken Anthropic id validates fine at the pydantic
+        # layer and would otherwise 400 on every completion with nothing here
+        # to say why — warn (never fail) for a known-broken id.
+        if config.ai.backend == "anthropic":
+            from .ai.backends import KNOWN_BROKEN_CLAUDE_MODELS
+            for field, model_id in (("ai.model", config.ai.model),
+                                    ("ai.utility_model", config.ai.utility_model)):
+                reason = KNOWN_BROKEN_CLAUDE_MODELS.get(model_id or "")
+                if reason:
+                    print(f"WARNING: {field}={model_id} {reason}", file=sys.stderr)
+        ai_model = f"ai_model={config.ai.model}"
+        if config.ai.utility_model:
+            ai_model += f" (utility={config.ai.utility_model})"
+        print(f"Configuration valid. mode={config.mode.value}, {ai_model}, "
               f"providers={len([p for p in config.data.providers if p.enabled])}, "
               f"brokers={len([b for b in config.brokers if b.enabled])}, "
               f"strategies={len([s for s in config.strategies if s.enabled])}")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "poseidon"
-version = "2.19.0"
+version = "2.19.1"
 description = "Autonomous AI trading platform with Claude as the portfolio manager. Private, single-user, Linux-native."
 readme = "README.md"
 license = { file = "LICENSE" }

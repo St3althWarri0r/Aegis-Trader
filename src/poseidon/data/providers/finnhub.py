@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ...core.clock import ensure_aware
 from ...core.errors import ProviderError
 from ...core.models import (
     EarningsEvent,
@@ -206,8 +207,7 @@ class FinnhubProvider(MarketDataProvider):
                 scheduled = datetime.fromisoformat(str(raw_time).replace(" ", "T"))
             except ValueError:
                 continue
-            if scheduled.tzinfo is None:
-                scheduled = scheduled.replace(tzinfo=UTC)
+            scheduled = ensure_aware(scheduled)
             if scheduled > horizon:
                 continue
             events.append(

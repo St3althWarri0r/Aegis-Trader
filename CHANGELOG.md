@@ -4,6 +4,67 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
+## [2.19.1] — 2026-09-02
+
+A follow-up review pass on v2.19.0's own diff (the guardian stale-snapshot
+fix, the live-book exit clearing, the model-id changes) surfaced further
+races and gaps in that same code — fixed here with regression tests.
+
+### Safety
+
+- **Two more guardian races that could disarm or misfire a stop.** (1)
+  `check_all` reads a plan, then awaits a live quote before triggering an
+  exit; a fill that re-arms the same symbol mid-await (new decision/stop/
+  quantity) was previously overwritten by the stale exit, which could fire
+  against the wrong decision or leave a resized position unprotected. (2)
+  `_maybe_deactivate`'s deactivate-if-gone UPDATE had no guard against a
+  concurrent re-arm landing between its read and its write, so it could
+  silently clobber a just-armed plan back to inactive. Both paths are now a
+  compare-and-swap on the plan's `updated_at`: a concurrent re-arm makes the
+  stale write affect zero rows instead of winning. A third, narrower race —
+  `_maybe_deactivate` reading the position before an await but the portfolio's
+  `synced_at` fresh after it — is closed by capturing both together.
+- **A guardian exit's own fill data decides whether it closed in full, not
+  the portfolio snapshot.** `on_order_filled` used to ask
+  `portfolio.position_for()` whether a guardian exit fully closed the
+  position; that snapshot and the fill-triggered portfolio resync are
+  unordered concurrent handlers of the same `ORDER_FILLED` event, so a stale
+  read could misreport "position gone" for a fill that only partially closed
+  — leaving the residual with no stop. It now compares the order's own
+  `filled_quantity` to `quantity`, which carries no such race.
+- **An emergency HALT now cancels every order the broker holds, not just the
+  ones in Poseidon's own table.** `cancel_all_open` was DB-only even though
+  this same v2.19.0 diff proved that view can be incomplete (that's why
+  `_clear_opposing_orders` was rewritten to merge in the broker's live book).
+  It now does the same merge, so an order parked from the brokerage's own UI
+  survives a halt no longer.
+- **A queued-cancel confirmation that fills instead of canceling is now
+  surfaced as a fill**, not audited as `exit.opposing_order_canceled` — for a
+  live-only order (no local row, no lifecycle poller) that bus event was the
+  only trace anywhere that the account's position had changed.
+- **A single transient broker error no longer collapses a cancel
+  confirmation's whole ~3s retry budget down to one attempt.** `_confirm_cancel`
+  now retries a failed status poll within its existing attempt budget instead
+  of ending the wait on the first hiccup.
+- Alpaca's order-status response parsing now raises `BrokerError` on
+  malformed fill data instead of an unhandled `decimal.InvalidOperation` that
+  abandoned whatever was polling it.
+
+### Changed
+
+- `ai.model`/`ai.utility_model` still accept any string, but `poseidon config
+  validate` now warns (never fails) when either names a known-broken
+  Anthropic id (e.g. the just-removed Haiku 4.5) and always prints the
+  configured model, so a stale config can't validate silently while every
+  completion 400s.
+- CI's Python matrix adds 3.13 (the classifiers already claimed support for
+  it; nothing exercised it).
+- The guardian's and risk engine's "is this portfolio snapshot fresh enough
+  to trust a missing order/position" grace window is now one shared constant
+  (`core.clock.SYNC_GRACE`) instead of two independently-tunable ones that
+  could drift apart. The repeated naive-datetime-as-UTC idiom is now one
+  `core.clock.ensure_aware()` helper.
+
 ## [2.19.0] — 2026-09-01
 
 A full-codebase audit release. Every safety-critical path — the order

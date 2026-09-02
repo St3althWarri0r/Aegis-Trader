@@ -408,6 +408,110 @@ async def test_plan_survives_a_sync_inside_the_grace_window(tmp_path) -> None:
     await db.close()
 
 
+async def test_check_all_skips_a_stale_exit_when_a_fill_races_the_quote(tmp_path) -> None:
+    """A concurrent fill can re-arm a plan's row (new decision_id/quantity)
+    while check_all awaits the quote for the OLD arming it already read. The
+    compare-and-swap in _trigger_exit must detect the row changed underneath
+    it and skip firing an exit keyed off the now-stale decision_id/quantity,
+    rather than clobbering the fresh arming and selling against the wrong
+    decision."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="94.50", position_qty="10")
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy(qty="10"))  # dec1, qty=10
+
+    original_quote = kernel.router.quote
+
+    async def racing_quote(symbol, allow_delayed=False):
+        # A fill lands and re-arms this SAME plan while the quote is in
+        # flight — exactly the window between check_all's row read and its
+        # await on kernel.router.quote.
+        await db.execute(
+            "UPDATE exit_plans SET decision_id = ?, quantity = ?, updated_at = ? "
+            "WHERE symbol = ?",
+            ("dec2", "20", datetime.now(UTC).isoformat(), symbol),
+        )
+        return await original_quote(symbol, allow_delayed=allow_delayed)
+
+    kernel.router.quote = racing_quote
+    await guardian.check_all()
+    await guardian.drain()
+
+    assert kernel.executed_decisions == [], "must not fire against the now-stale read"
+    plans = await guardian.active_plans()
+    assert len(plans) == 1
+    assert plans[0]["quantity"] == "20", "the fresh arming must survive untouched"
+    await db.close()
+
+
+async def test_maybe_deactivate_skips_when_a_fill_races_the_grace_check(tmp_path) -> None:
+    """A concurrent fill can re-arm the plan's row between _maybe_deactivate's
+    updated_at SELECT and its deactivating UPDATE. The compare-and-swap must
+    detect the row changed and leave the fresh arming alone, instead of
+    silently clobbering it back to inactive."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty=None)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy(qty="10"))
+    await _backdate_plan(db, "AAPL", 60)  # armed a minute ago
+    kernel.portfolio.synced_at = datetime.now(UTC)  # postdates arming -> would deactivate
+
+    real_fetch_one = db.fetch_one
+
+    async def racing_fetch_one(sql, params=()):
+        result = await real_fetch_one(sql, params)
+        if "exit_plans" in sql and "updated_at" in sql:
+            await db.execute(
+                "UPDATE exit_plans SET decision_id = ?, quantity = ?, updated_at = ? "
+                "WHERE symbol = ?",
+                ("dec2", "20", datetime.now(UTC).isoformat(), "AAPL"),
+            )
+        return result
+
+    db.fetch_one = racing_fetch_one  # type: ignore[method-assign]
+    await guardian._maybe_deactivate("AAPL", "position no longer held")
+
+    plans = await guardian.active_plans()
+    assert len(plans) == 1
+    assert plans[0]["quantity"] == "20", "the fresh arming must survive untouched"
+    await db.close()
+
+
+async def test_maybe_deactivate_captures_synced_at_with_position_not_after(tmp_path) -> None:
+    """``position`` and ``synced_at`` must be captured together, from the same
+    sync pass. If a full portfolio sync lands during the fetch_one await,
+    ``synced_at`` can advance to postdate the arming even though the
+    ALREADY-CAPTURED ``position`` reading is the stale pre-sync one — that
+    combination must not wrongly validate a "position gone" reading the fresh
+    sync actually contradicts."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty=None)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())
+    await _backdate_plan(db, "AAPL", 60)  # armed a minute ago
+    # Predates that arming by more than the grace (-90s < -60s + 10s grace).
+    kernel.portfolio.synced_at = datetime.now(UTC) - timedelta(seconds=90)
+
+    real_fetch_one = db.fetch_one
+
+    async def sync_lands_during_fetch(sql, params=()):
+        # A full sync completes mid-await: the position is real (10 held) and
+        # synced_at advances to postdate the arming — but _maybe_deactivate
+        # already captured the STALE "gone" position before this call.
+        kernel._position_qty = "10"
+        kernel.portfolio.synced_at = datetime.now(UTC)
+        return await real_fetch_one(sql, params)
+
+    db.fetch_one = sync_lands_during_fetch  # type: ignore[method-assign]
+    await guardian._maybe_deactivate("AAPL", "position no longer held")
+
+    assert [p["symbol"] for p in await guardian.active_plans()] == ["AAPL"], (
+        "must not deactivate off a position reading that predates the sync which "
+        "actually confirmed it"
+    )
+    await db.close()
+
+
 async def test_sell_fill_does_not_disarm_on_a_stale_snapshot(tmp_path) -> None:
     """A partial exit fill on a position the snapshot has not seen yet must not
     disarm the remainder's stop."""

@@ -11,7 +11,7 @@ polling (websocket streaming is handled by the sync service's poll cadence).
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ...core.enums import (
@@ -305,10 +305,20 @@ class AlpacaBroker(Broker):
 
     def _merge_order(self, order: Order, response: dict[str, Any]) -> Order:
         order.status = _STATUS_MAP.get(response.get("status", ""), order.status)
-        if response.get("filled_qty"):
-            order.filled_quantity = Decimal(response["filled_qty"])
-        if response.get("filled_avg_price"):
-            order.avg_fill_price = Decimal(response["filled_avg_price"])
+        try:
+            if response.get("filled_qty"):
+                order.filled_quantity = Decimal(response["filled_qty"])
+            if response.get("filled_avg_price"):
+                order.avg_fill_price = Decimal(response["filled_avg_price"])
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            # A boundary failure (malformed/unexpected field in the broker's
+            # own response), not a status-poll transport error — raised as
+            # BrokerError so callers (_confirm_cancel, _poll_to_terminal) hit
+            # their existing except BrokerError degrade instead of an
+            # unhandled exception abandoning the caller's whole operation.
+            raise BrokerError(
+                self.name, f"malformed fill data in order response: {exc}", retryable=False
+            ) from exc
         order.updated_at = datetime.now(UTC)
         return order
 
