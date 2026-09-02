@@ -66,7 +66,10 @@ TRADE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "symbol": {"type": "string", "description": "Ticker or OCC option symbol"},
-        "asset_class": {"type": "string", "enum": ["equity", "etf", "option"]},
+        # "crypto" is accepted so a BASE/USD proposal is labelled honestly; a
+        # slash-form symbol is tagged CRYPTO by ProposedTrade regardless, so an
+        # older "equity" label on a pair still routes correctly.
+        "asset_class": {"type": "string", "enum": ["equity", "etf", "option", "crypto"]},
         "side": {"type": "string", "enum": _SIDE_ENUM},
         "order_type": {"type": "string", "enum": _ORDER_TYPE_ENUM},
         "quantity": {"type": "string", "description": "Decimal string; contracts for options"},

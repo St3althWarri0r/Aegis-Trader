@@ -23,7 +23,7 @@ review cycles.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import structlog
@@ -50,6 +50,16 @@ log = structlog.get_logger(__name__)
 # loop back to the human every guardian tick.
 _EXIT_FAILED = {OrderStatus.REJECTED_RISK, OrderStatus.REJECTED_BROKER,
                 OrderStatus.ERROR, OrderStatus.CANCELED, OrderStatus.EXPIRED}
+
+# A "no position" reading from the synced snapshot is only PROOF the position is
+# gone when that snapshot was taken after the plan was armed. A fill arms a plan
+# the moment the order poller sees it, but the portfolio snapshot is refreshed on
+# the sync interval — so the guardian's next tick routinely runs against a
+# snapshot older than the fill, sees no position, and (before this guard) disarmed
+# the brand-new stop as "position no longer held". The grace mirrors the risk
+# engine's ``_reconcile_pending``: a sync pass whose fetches straddled the fill
+# stamps ``synced_at`` after the arming yet still misses the position.
+_SNAPSHOT_GRACE = timedelta(seconds=10)
 
 
 class PositionGuardian:
@@ -154,12 +164,47 @@ class PositionGuardian:
         # A qty-0 row (some brokers report one after a same-day flat) counts
         # as gone — otherwise the plan stays armed with stale levels and can
         # force-sell a later manual re-buy on its first tick.
-        if position is None or position.quantity <= 0:
-            await self._db.execute(
-                "UPDATE exit_plans SET active = 0, triggered_reason = ?, updated_at = ? "
-                "WHERE symbol = ? AND active = 1",
-                (reason, datetime.now(UTC).isoformat(), symbol.upper()),
-            )
+        if position is not None and position.quantity > 0:
+            return
+        row = await self._db.fetch_one(
+            "SELECT updated_at FROM exit_plans WHERE symbol = ? AND active = 1",
+            (symbol.upper(),),
+        )
+        if row is None:
+            return
+        if not self._snapshot_postdates_arming(portfolio, str(row[0])):
+            # The snapshot predates the arming (or was never taken): "no
+            # position" says nothing about the fill that armed this plan. Keep
+            # the stop; the next sync will either show the position (and the
+            # guardian enforces) or, taken after the grace, prove it gone.
+            log.info("exit plan kept armed: portfolio snapshot predates its arming",
+                     symbol=symbol, armed_at=row[0],
+                     synced_at=getattr(portfolio, "synced_at", None))
+            return
+        await self._db.execute(
+            "UPDATE exit_plans SET active = 0, triggered_reason = ?, updated_at = ? "
+            "WHERE symbol = ? AND active = 1",
+            (reason, datetime.now(UTC).isoformat(), symbol.upper()),
+        )
+
+    @staticmethod
+    def _snapshot_postdates_arming(portfolio: object, armed_at_iso: str) -> bool:
+        """True only when the portfolio snapshot was taken at least
+        ``_SNAPSHOT_GRACE`` after the plan was armed — the only snapshot whose
+        missing position can be believed. A never-synced portfolio (``None``)
+        proves nothing."""
+        synced_at = getattr(portfolio, "synced_at", None)
+        if not isinstance(synced_at, datetime):
+            return False
+        try:
+            armed_at = datetime.fromisoformat(armed_at_iso)
+        except ValueError:
+            return True  # an unparseable stamp cannot hold a plan armed forever
+        if armed_at.tzinfo is None:
+            armed_at = armed_at.replace(tzinfo=UTC)
+        if synced_at.tzinfo is None:
+            synced_at = synced_at.replace(tzinfo=UTC)
+        return synced_at >= armed_at + _SNAPSHOT_GRACE
 
     # -- the watch loop (scheduler job) ------------------------------------------
 

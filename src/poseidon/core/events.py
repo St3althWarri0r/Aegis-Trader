@@ -70,6 +70,18 @@ class EventBus:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
 
+    def publish_nowait(self, topic: str, payload: Any = None) -> None:
+        """Schedule ``publish`` from synchronous code (a risk-engine trip, a
+        breaker) without awaiting it. The scheduling task is held in the bus's
+        own task set: the event loop keeps only weak references to tasks, so a
+        bare ``create_task`` whose result nobody holds can be garbage-collected
+        mid-flight — the documented hazard this method exists to avoid."""
+        if self._closed:
+            return
+        task = asyncio.create_task(self.publish(topic, payload))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def _run(self, handler: Handler, topic: str, payload: Any) -> None:
         try:
             await handler(topic, payload)

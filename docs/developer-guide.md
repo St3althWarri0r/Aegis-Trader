@@ -78,7 +78,7 @@ grid, tabular numerals in tables/axes.
 ## Release / CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs ruff, mypy (strict), and
-pytest on 3.11 and 3.12 and builds the Docker image on every push. Version
+pytest on 3.11, 3.12 and 3.14 and builds the Docker image on every push. Version
 lives in
 `poseidon/__init__.py` + `pyproject.toml`; the PKGBUILD derives
 `pkgver` from `pyproject.toml`.

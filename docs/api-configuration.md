@@ -4,7 +4,7 @@
 
 1. Create an API key at <https://console.anthropic.com>.
 2. `poseidon vault set anthropic_api_key`
-3. `ai.model` defaults to `claude-opus-4-8`. `ai.effort` trades depth for
+3. `ai.model` defaults to `claude-opus-5`. `ai.effort` trades depth for
    cost/latency per review cycle (`high` recommended; `xhigh`/`max` for
    the most careful reasoning).
 
@@ -77,12 +77,12 @@ on a cheaper/faster **utility** model:
 
 ```yaml
 ai:
-  model: claude-opus-4-8                     # the money decision + reviewer
-  utility_model: claude-haiku-4-5-20251001   # operator chat + reflection lessons
+  model: claude-opus-5                       # the money decision + reviewer
+  utility_model: claude-sonnet-5             # operator chat + reflection lessons
 ```
 
 The utility model uses the **same backend and endpoint** as the primary with only
-the model swapped (Anthropic Opus→Haiku on one account, or a smaller local model
+the model swapped (Anthropic Opus→Sonnet on one account, or a smaller local model
 served at the same LM Studio endpoint). Leave `utility_model` unset — the default
 — and every role shares the primary backend exactly as before.
 

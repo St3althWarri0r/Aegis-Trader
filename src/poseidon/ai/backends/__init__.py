@@ -24,9 +24,15 @@ __all__ = ["CURATED_CLAUDE_MODELS", "ChatBackend", "LLMResponse", "ToolCall",
 # decision (force_tool is None) — a non-adaptive id would 400. A custom id can
 # still be typed in the UI; this list is only the curated menu. Extend it as
 # Anthropic ships adaptive-capable ids (verify via the claude-api skill).
+# Haiku 4.5 is deliberately ABSENT: it takes the legacy ``budget_tokens``
+# thinking form and rejects ``output_config.effort``, so it 400s on the first
+# completion — as the primary AND as ``ai.utility_model`` (every role but the
+# forced-tool reviewer sends that shape). Fable 5.1 is absent because it
+# rejects the forced tool_choice the algorithm reviewer relies on.
 CURATED_CLAUDE_MODELS: tuple[str, ...] = (
+    "claude-opus-5",
     "claude-opus-4-8",
-    "claude-haiku-4-5-20251001",
+    "claude-sonnet-5",
 )
 
 

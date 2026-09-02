@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "poseidon"
-version = "2.18.0"
+version = "2.19.0"
 description = "Autonomous AI trading platform with Claude as the portfolio manager. Private, single-user, Linux-native."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -18,17 +18,19 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 
 dependencies = [
-    "anthropic>=0.49",
+    "anthropic>=1,<2",
     "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "PyYAML>=6.0",
     "structlog>=24.1",
-    "cryptography>=42.0",
+    "cryptography>=50.0",
     "aiosqlite>=0.20",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
